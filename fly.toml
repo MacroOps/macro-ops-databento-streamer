@@ -1,19 +1,23 @@
-# Databento Live Streamer - Fly.io Configuration
-app = "macro-ops-databento-streamer"
-primary_region = "ord"  # Chicago - closest to CME
+# fly.toml app configuration file generated for macro-ops-databento-streamer on 2026-03-17T20:56:10Z
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+
+app = 'macro-ops-databento-streamer'
+primary_region = 'ord'
 
 [build]
-  dockerfile = "Dockerfile"
 
-[env]
-  BACKEND_URL = "https://macro-ops-backend.fly.dev"
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = 'stop'
+  auto_start_machines = true
+  min_machines_running = 0
+  processes = ['app']
 
-# This is a background worker - no HTTP service needed
-[processes]
-  worker = "python -u streamer.py"
-
-# Use minimal resources - this is just a data pipe
 [[vm]]
-  cpu_kind = "shared"
+  memory = '1gb'
+  cpu_kind = 'shared'
   cpus = 1
-  memory_mb = 512
+  memory_mb = 256
