@@ -1,0 +1,2 @@
+databento>=0.30.0
+requests>=2.28.0
