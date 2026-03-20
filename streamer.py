@@ -64,6 +64,7 @@ class DatabentoStreamer:
         self.records_received = 0
         self.ohlcv_processed = 0
         self.last_stats_time = time.time()
+        self.symbol_map = {}  # instrument_id -> symbol name
         
     def start(self):
         """Start the live streaming connection."""
@@ -145,18 +146,29 @@ class DatabentoStreamer:
             # Get record type
             record_type = type(record).__name__
             
-            if record_type == "OhlcvMsg":
+            if record_type in ("OhlcvMsg", "OHLCVMsg"):
                 self._process_ohlcv(record)
-            elif record_type == "MboMsg" or record_type == "Mbp1Msg":
+            elif record_type in ("MboMsg", "Mbp1Msg", "MBOMsg", "MBP1Msg"):
                 self._process_quote(record)
-            elif record_type == "TradeMsg":
+            elif record_type in ("TradeMsg", "TRADEMsg"):
                 self._process_trade(record)
             elif record_type == "ErrorMsg":
                 logger.error(f"Databento error: {record.err}")
             elif record_type == "SystemMsg":
                 logger.info(f"Databento system: {record.msg}")
-            elif record_type == "SymbolMappingMsg":
-                logger.info(f"Symbol mapping: {getattr(record, 'stype_in_symbol', '?')} -> {getattr(record, 'stype_out_symbol', '?')}")
+            elif record_type in ("SymbolMappingMsg", "SymbolMappingMsgV2"):
+                in_sym = getattr(record, 'stype_in_symbol', None)
+                out_sym = getattr(record, 'stype_out_symbol', None)
+                iid = getattr(record, 'instrument_id', None)
+                if out_sym and iid is not None:
+                    clean = self._clean_symbol(out_sym)
+                    if clean:
+                        self.symbol_map[iid] = clean
+                        logger.info(f"Symbol mapping: {in_sym} -> {out_sym} (id={iid}) -> {clean}")
+                    else:
+                        logger.info(f"Symbol mapping (unclean): {in_sym} -> {out_sym} (id={iid})")
+                else:
+                    logger.info(f"Symbol mapping: {in_sym} -> {out_sym} (id={iid})")
             else:
                 logger.info(f"Unknown record type: {record_type} attrs={[a for a in dir(record) if not a.startswith('_')]}")
                 
@@ -271,29 +283,54 @@ class DatabentoStreamer:
             logger.error(f"Error processing trade: {e}")
     
     def _get_symbol(self, record):
-        """Extract clean symbol from record."""
+        """Extract clean symbol from record using instrument_id -> symbol map."""
         try:
-            # Try pretty_symbol first (databento-python provides this for mapped symbols)
-            raw_symbol = getattr(record, 'pretty_symbol', None)
-            if not raw_symbol:
-                raw_symbol = getattr(record, 'symbol', None)
+            instrument_id = getattr(record, 'instrument_id', None)
             
-            if raw_symbol and raw_symbol.strip():
-                raw_symbol = raw_symbol.strip()
-                # If it's already a parent symbol like "ES.FUT", extract root
-                if '.FUT' in raw_symbol:
-                    return raw_symbol.split('.')[0]
-                # Clean up specific contract (e.g., "ESM6" -> "ES", "ESH26" -> "ES")
-                # Strip trailing digits first, then month code
-                cleaned = raw_symbol.rstrip('0123456789')
-                if cleaned and cleaned[-1] in 'FGHJKMNQUVXZ':
-                    cleaned = cleaned[:-1]
-                return cleaned if cleaned else raw_symbol
+            # Check our local symbol map first
+            if instrument_id is not None and instrument_id in self.symbol_map:
+                return self.symbol_map[instrument_id]
+            
+            # Try to get symbol from the client's symbology map
+            if self.client and instrument_id is not None:
+                try:
+                    sym_map = self.client.symbology_map
+                    if sym_map and instrument_id in sym_map:
+                        raw_symbol = sym_map[instrument_id]
+                        clean = self._clean_symbol(raw_symbol)
+                        if clean:
+                            self.symbol_map[instrument_id] = clean
+                            logger.info(f"Mapped instrument {instrument_id} -> {raw_symbol} -> {clean}")
+                            return clean
+                except Exception as e:
+                    logger.debug(f"Symbology map lookup failed: {e}")
+            
+            # Try attributes on the record directly
+            for attr in ('pretty_symbol', 'symbol'):
+                raw_symbol = getattr(record, attr, None)
+                if raw_symbol and str(raw_symbol).strip():
+                    clean = self._clean_symbol(str(raw_symbol).strip())
+                    if clean and instrument_id is not None:
+                        self.symbol_map[instrument_id] = clean
+                    return clean
             
             return None
         except Exception as e:
             logger.error(f"Symbol extraction error: {e}")
             return None
+    
+    def _clean_symbol(self, raw_symbol):
+        """Clean a raw symbol string to its root (e.g., 'ESM6' -> 'ES')."""
+        if not raw_symbol:
+            return None
+        # If it's a parent symbol like "ES.FUT", extract root
+        if '.FUT' in raw_symbol:
+            return raw_symbol.split('.')[0]
+        # Clean up specific contract (e.g., "ESM6" -> "ES", "ESH26" -> "ES")
+        cleaned = raw_symbol.rstrip('0123456789')
+        if cleaned and cleaned[-1] in 'FGHJKMNQUVXZ':
+            cleaned = cleaned[:-1]
+        return cleaned if cleaned else raw_symbol
     
     def _push_to_backend(self):
         """Push aggregated data to Node.js backend."""
