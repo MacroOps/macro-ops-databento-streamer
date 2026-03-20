@@ -61,6 +61,9 @@ class DatabentoStreamer:
         self.quotes = {}  # symbol -> latest quote
         self.last_push = time.time()
         self.push_interval = 1.0  # Push updates every 1 second
+        self.records_received = 0
+        self.ohlcv_processed = 0
+        self.last_stats_time = time.time()
         
     def start(self):
         """Start the live streaming connection."""
@@ -120,12 +123,18 @@ class DatabentoStreamer:
             if shutdown_event.is_set():
                 break
                 
+            self.records_received += 1
             self._process_record(record)
             
             # Periodically push aggregated data to backend
             if time.time() - self.last_push >= self.push_interval:
                 self._push_to_backend()
                 self.last_push = time.time()
+            
+            # Log stats every 60 seconds
+            if time.time() - self.last_stats_time >= 60:
+                logger.info(f"Stats: {self.records_received} records received, {self.ohlcv_processed} OHLCV processed, {len(self.bars)} bars, {len(self.quotes)} quotes buffered")
+                self.last_stats_time = time.time()
         
         logger.info("Closing Databento connection...")
         self.client.stop()
@@ -147,7 +156,9 @@ class DatabentoStreamer:
             elif record_type == "SystemMsg":
                 logger.info(f"Databento system: {record.msg}")
             elif record_type == "SymbolMappingMsg":
-                logger.debug(f"Symbol mapping: {record.stype_in_symbol} -> {record.stype_out_symbol}")
+                logger.info(f"Symbol mapping: {getattr(record, 'stype_in_symbol', '?')} -> {getattr(record, 'stype_out_symbol', '?')}")
+            else:
+                logger.info(f"Unknown record type: {record_type} attrs={[a for a in dir(record) if not a.startswith('_')]}")
                 
         except Exception as e:
             logger.error(f"Error processing record: {e}")
@@ -158,6 +169,7 @@ class DatabentoStreamer:
             # Get symbol from record
             symbol = self._get_symbol(record)
             if not symbol:
+                logger.warning(f"OHLCV record with no symbol: instrument_id={getattr(record, 'instrument_id', '?')} raw_symbol={getattr(record, 'symbol', '?')} pretty={getattr(record, 'pretty_symbol', '?')} close={getattr(record, 'close', '?')}")
                 return
             
             # Extract OHLCV values (prices are in fixed-point, divide by 1e9)
@@ -199,7 +211,9 @@ class DatabentoStreamer:
                 "source": "databento_live",
             }
             
-            logger.debug(f"OHLCV {symbol}: O={open_price:.2f} H={high_price:.2f} L={low_price:.2f} C={close_price:.2f} V={volume}")
+            self.ohlcv_processed += 1
+            if self.ohlcv_processed <= 5 or self.ohlcv_processed % 100 == 0:
+                logger.info(f"OHLCV {symbol}: O={open_price:.2f} H={high_price:.2f} L={low_price:.2f} C={close_price:.2f} V={volume}")
             
         except Exception as e:
             logger.error(f"Error processing OHLCV: {e}")
@@ -259,19 +273,26 @@ class DatabentoStreamer:
     def _get_symbol(self, record):
         """Extract clean symbol from record."""
         try:
-            # Try different ways to get the symbol
-            if hasattr(record, 'instrument_id'):
-                # Map instrument_id to symbol if available
-                pass
+            # Try pretty_symbol first (databento-python provides this for mapped symbols)
+            raw_symbol = getattr(record, 'pretty_symbol', None)
+            if not raw_symbol:
+                raw_symbol = getattr(record, 'symbol', None)
             
-            # For parent symbols, extract root
-            raw_symbol = getattr(record, 'symbol', None)
-            if raw_symbol:
-                # Clean up symbol (e.g., "ESH4" -> "ES")
-                return raw_symbol.rstrip('0123456789').rstrip('FGHJKMNQUVXZ') or raw_symbol
+            if raw_symbol and raw_symbol.strip():
+                raw_symbol = raw_symbol.strip()
+                # If it's already a parent symbol like "ES.FUT", extract root
+                if '.FUT' in raw_symbol:
+                    return raw_symbol.split('.')[0]
+                # Clean up specific contract (e.g., "ESM6" -> "ES", "ESH26" -> "ES")
+                # Strip trailing digits first, then month code
+                cleaned = raw_symbol.rstrip('0123456789')
+                if cleaned and cleaned[-1] in 'FGHJKMNQUVXZ':
+                    cleaned = cleaned[:-1]
+                return cleaned if cleaned else raw_symbol
             
             return None
-        except:
+        except Exception as e:
+            logger.error(f"Symbol extraction error: {e}")
             return None
     
     def _push_to_backend(self):
