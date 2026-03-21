@@ -57,7 +57,7 @@ class DatabentoStreamer:
     
     def __init__(self):
         self.client = None
-        self.bars = defaultdict(dict)  # symbol -> {open, high, low, close, volume}
+        self.daily_bars = {}  # symbol -> aggregated daily OHLCV
         self.quotes = {}  # symbol -> latest quote
         self.last_push = time.time()
         self.push_interval = 1.0  # Push updates every 1 second
@@ -65,6 +65,7 @@ class DatabentoStreamer:
         self.ohlcv_processed = 0
         self.last_stats_time = time.time()
         self.symbol_map = {}  # instrument_id -> symbol name
+        self.current_date = datetime.now(timezone.utc).strftime('%Y-%m-%d')  # Track current trading date
         
     def start(self):
         """Start the live streaming connection."""
@@ -134,7 +135,7 @@ class DatabentoStreamer:
             
             # Log stats every 60 seconds
             if time.time() - self.last_stats_time >= 60:
-                logger.info(f"Stats: {self.records_received} records received, {self.ohlcv_processed} OHLCV processed, {len(self.bars)} bars, {len(self.quotes)} quotes buffered")
+                logger.info(f"Stats: {self.records_received} records received, {self.ohlcv_processed} OHLCV processed, {len(self.daily_bars)} daily bars, {len(self.quotes)} quotes buffered")
                 self.last_stats_time = time.time()
         
         logger.info("Closing Databento connection...")
@@ -176,7 +177,7 @@ class DatabentoStreamer:
             logger.error(f"Error processing record: {e}")
     
     def _process_ohlcv(self, record):
-        """Process OHLCV bar record."""
+        """Process OHLCV 1-minute bar and aggregate into daily bar."""
         try:
             # Get symbol from record
             symbol = self._get_symbol(record)
@@ -198,34 +199,52 @@ class DatabentoStreamer:
             # Get timestamp
             ts_event = record.ts_event  # nanoseconds since epoch
             dt = datetime.fromtimestamp(ts_event / 1e9, tz=timezone.utc)
+            bar_date = dt.strftime('%Y-%m-%d')
             
-            # Store bar data
-            self.bars[symbol] = {
-                "symbol": symbol,
-                "time": dt.isoformat(),
-                "open": open_price,
-                "high": high_price,
-                "low": low_price,
-                "close": close_price,
-                "volume": volume,
-                "timestamp": int(time.time() * 1000),
-            }
+            # Check if date rolled over — reset daily bars if so
+            if bar_date != self.current_date:
+                logger.info(f"Date rolled from {self.current_date} to {bar_date}, resetting daily bars")
+                self.daily_bars.clear()
+                self.current_date = bar_date
             
-            # Also update quote from latest bar
+            # Aggregate into daily bar
+            if symbol in self.daily_bars:
+                bar = self.daily_bars[symbol]
+                # Update running high/low, latest close, cumulative volume
+                bar["high"] = max(bar["high"], high_price)
+                bar["low"] = min(bar["low"], low_price)
+                bar["close"] = close_price
+                bar["volume"] += volume
+                bar["timestamp"] = int(time.time() * 1000)
+            else:
+                # First bar of the day for this symbol
+                self.daily_bars[symbol] = {
+                    "symbol": symbol,
+                    "time": bar_date,
+                    "open": open_price,
+                    "high": high_price,
+                    "low": low_price,
+                    "close": close_price,
+                    "volume": volume,
+                    "timestamp": int(time.time() * 1000),
+                }
+            
+            # Also update quote from latest aggregated daily data
+            agg = self.daily_bars[symbol]
             self.quotes[symbol] = {
                 "symbol": symbol,
                 "price": close_price,
-                "open": open_price,
-                "high": high_price,
-                "low": low_price,
-                "volume": volume,
+                "open": agg["open"],
+                "high": agg["high"],
+                "low": agg["low"],
+                "volume": agg["volume"],
                 "timestamp": int(time.time() * 1000),
                 "source": "databento_live",
             }
             
             self.ohlcv_processed += 1
             if self.ohlcv_processed <= 5 or self.ohlcv_processed % 100 == 0:
-                logger.info(f"OHLCV {symbol}: O={open_price:.2f} H={high_price:.2f} L={low_price:.2f} C={close_price:.2f} V={volume}")
+                logger.info(f"OHLCV {symbol}: 1m bar O={open_price:.2f} H={high_price:.2f} L={low_price:.2f} C={close_price:.2f} V={volume} | Day agg O={agg['open']:.2f} H={agg['high']:.2f} L={agg['low']:.2f} C={agg['close']:.2f} V={agg['volume']}")
             
         except Exception as e:
             logger.error(f"Error processing OHLCV: {e}")
@@ -333,12 +352,12 @@ class DatabentoStreamer:
         return cleaned if cleaned else raw_symbol
     
     def _push_to_backend(self):
-        """Push aggregated data to Node.js backend."""
-        if not self.bars and not self.quotes:
+        """Push aggregated daily data to Node.js backend."""
+        if not self.daily_bars and not self.quotes:
             return
         
         payload = {
-            "bars": list(self.bars.values()),
+            "bars": list(self.daily_bars.values()),
             "quotes": list(self.quotes.values()),
             "timestamp": int(time.time() * 1000),
             "source": "databento_live_streamer",
